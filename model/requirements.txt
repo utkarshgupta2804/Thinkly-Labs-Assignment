@@ -1,0 +1,9 @@
+pypdf
+sentence-transformers
+faiss-cpu
+google-generativeai
+numpy
+tqdm
+flask
+flask-cors
+python-dotenv
