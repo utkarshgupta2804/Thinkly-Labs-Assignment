@@ -4,7 +4,8 @@ import faiss
 import pickle
 import numpy as np
 from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os
 from pypdf import PdfReader
 from config import GEMINI_API_KEY, MODEL_NAME, EMBEDDING_MODEL
@@ -15,41 +16,51 @@ CORS(app)
 # 50MB max upload size
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# Configure Gemini client
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(MODEL_NAME)
-
 DATA_PATH = "data"
 os.makedirs(DATA_PATH, exist_ok=True)
 
-# Load embedding model first (needed to know dimension for empty index)
-print("📦 Loading embedding model...")
-embed_model = SentenceTransformer(EMBEDDING_MODEL)
-EMBEDDING_DIM = embed_model.get_sentence_embedding_dimension()
+# Configure Gemini client (new SDK)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Load or initialize FAISS index and data
-print("📦 Loading index...")
-if os.path.exists("faiss_index.bin") and os.path.exists("chunks.pkl") and os.path.exists("metadata.pkl"):
-    index = faiss.read_index("faiss_index.bin")
-    with open("chunks.pkl", "rb") as f:
-        chunks = pickle.load(f)
-    with open("metadata.pkl", "rb") as f:
-        metadata = pickle.load(f)
-    print(f"✅ Loaded existing index with {len(chunks)} chunks.")
-else:
-    # No index found — start with an empty one (uploads will populate it)
-    print("⚠️  No index found. Starting with empty index — upload PDFs to populate.")
-    index = faiss.IndexFlatL2(EMBEDDING_DIM)
-    chunks = []
-    metadata = []
+# ── Lazy globals (loaded once on first request, not at startup) ────────────────
+_embed_model = None
+_index = None
+_chunks = []
+_metadata = []
+_initialized = False
 
-print("✅ Flask RAG backend ready!")
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        print("📦 Loading embedding model...")
+        _embed_model = SentenceTransformer(EMBEDDING_MODEL)
+        print("✅ Embedding model loaded.")
+    return _embed_model
+
+def get_index():
+    global _index, _chunks, _metadata, _initialized
+    if not _initialized:
+        _initialized = True
+        if (os.path.exists("faiss_index.bin")
+                and os.path.exists("chunks.pkl")
+                and os.path.exists("metadata.pkl")):
+            print("📦 Loading FAISS index...")
+            _index = faiss.read_index("faiss_index.bin")
+            with open("chunks.pkl", "rb") as f:
+                _chunks = pickle.load(f)
+            with open("metadata.pkl", "rb") as f:
+                _metadata = pickle.load(f)
+            print(f"✅ Loaded index with {len(_chunks)} chunks.")
+        else:
+            print("⚠️  No index found. Starting with empty index.")
+            dim = get_embed_model().get_sentence_embedding_dimension()
+            _index = faiss.IndexFlatL2(dim)
+    return _index
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_path):
-    """Extract text from every page of a PDF file."""
     reader = PdfReader(pdf_path)
     pages = []
     for page_num, page in enumerate(reader.pages):
@@ -60,7 +71,6 @@ def extract_text_from_pdf(pdf_path):
 
 
 def chunk_text(text, chunk_size=500, overlap=200):
-    """Split text into overlapping chunks."""
     result = []
     for j in range(0, len(text), chunk_size - overlap):
         chunk = text[j:j + chunk_size]
@@ -70,15 +80,17 @@ def chunk_text(text, chunk_size=500, overlap=200):
 
 
 def retrieve(query, k=5):
+    index = get_index()
     if index.ntotal == 0:
         return []
     k = min(k, index.ntotal)
+    embed_model = get_embed_model()
     query_embedding = embed_model.encode(query)
     distances, indices = index.search(np.array([query_embedding]), k)
     results = []
     for i in indices[0]:
-        if i < len(chunks):
-            results.append(chunks[i])
+        if i < len(_chunks):
+            results.append(_chunks[i])
     return results
 
 
@@ -96,91 +108,86 @@ Context:
 
 Question: {query}
 Answer:"""
-    response = gemini_model.generate_content(prompt)
+
+    response = gemini_client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+    )
     return response.text.strip()
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check — does NOT load the model, always responds instantly."""
+    return jsonify({
+        "status": "ok",
+        "model": MODEL_NAME,
+        "chunks_loaded": len(_chunks),
+        "index_ready": _index.ntotal > 0 if _index else False,
+    })
+
+
 @app.route("/upload", methods=["POST"])
 def upload_pdf():
-    """
-    POST /upload
-    Form-data: { "file": <pdf file> }
-    Saves PDF to /data, extracts text, builds embeddings,
-    and adds them to the live FAISS index.
-    Returns: { "message": "...", "chunks_added": N, "filename": "..." }
-    """
-    global index, chunks, metadata
+    global _index, _chunks, _metadata
 
     if "file" not in request.files:
         return jsonify({"error": "No file provided. Use key 'file' in form-data."}), 400
 
     file = request.files["file"]
-
     if file.filename == "":
         return jsonify({"error": "No file selected."}), 400
-
     if not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Only PDF files are supported."}), 400
 
-    # Save to /data folder
     save_path = os.path.join(DATA_PATH, file.filename)
     file.save(save_path)
     print(f"📄 Saved PDF: {save_path}")
 
-    # Extract text
     pages = extract_text_from_pdf(save_path)
     if not pages:
         return jsonify({"error": "Could not extract any text from the PDF."}), 422
 
-    # Chunk text
     new_chunks = []
     new_metadata = []
     for page in pages:
-        page_chunks = chunk_text(page["text"])
-        for chunk in page_chunks:
+        for chunk in chunk_text(page["text"]):
             new_chunks.append(chunk)
             new_metadata.append({"source": file.filename, "page": page["page"]})
 
     if not new_chunks:
         return jsonify({"error": "No usable text chunks found in the PDF."}), 422
 
-    # Create embeddings
+    embed_model = get_embed_model()
+    index = get_index()
+
     print(f"🔢 Creating embeddings for {len(new_chunks)} chunks...")
-    new_embeddings = embed_model.encode(new_chunks, show_progress_bar=False)
-    new_embeddings = np.array(new_embeddings)
+    new_embeddings = np.array(embed_model.encode(new_chunks, show_progress_bar=False))
 
-    # Add to live FAISS index
     index.add(new_embeddings)
-    chunks.extend(new_chunks)
-    metadata.extend(new_metadata)
+    _chunks.extend(new_chunks)
+    _metadata.extend(new_metadata)
 
-    # Persist updated index and chunks to disk
     faiss.write_index(index, "faiss_index.bin")
     with open("chunks.pkl", "wb") as f:
-        pickle.dump(chunks, f)
+        pickle.dump(_chunks, f)
     with open("metadata.pkl", "wb") as f:
-        pickle.dump(metadata, f)
+        pickle.dump(_metadata, f)
 
-    print(f"✅ Added {len(new_chunks)} chunks from '{file.filename}' to index.")
+    print(f"✅ Added {len(new_chunks)} chunks from '{file.filename}'.")
     return jsonify({
         "message": f"PDF '{file.filename}' uploaded and indexed successfully.",
         "chunks_added": len(new_chunks),
         "filename": file.filename,
-        "total_chunks": len(chunks)
+        "total_chunks": len(_chunks),
     })
 
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    """
-    POST /ask
-    Body: { "query": "your question here", "k": 5 (optional) }
-    Returns: { "query": "...", "answer": "...", "contexts": [...] }
-    """
     data = request.get_json()
-
     if not data or "query" not in data:
         return jsonify({"error": "Missing 'query' field in request body"}), 400
 
@@ -193,25 +200,11 @@ def ask():
     try:
         contexts = retrieve(query, k=k)
         answer = generate_answer(query, contexts)
-        return jsonify({
-            "query": query,
-            "answer": answer,
-            "contexts": contexts
-        })
+        return jsonify({"query": query, "answer": answer, "contexts": contexts})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check endpoint."""
-    return jsonify({
-        "status": "ok",
-        "model": MODEL_NAME,
-        "chunks_loaded": len(chunks),
-        "index_ready": index.ntotal > 0
-    })
-
-
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)

@@ -1,10 +1,10 @@
 pypdf
-sentence-transformers
 faiss-cpu
-google-generativeai
+google-genai
 numpy
 tqdm
 flask
 flask-cors
 python-dotenv
 gunicorn
+sentence-transformers
