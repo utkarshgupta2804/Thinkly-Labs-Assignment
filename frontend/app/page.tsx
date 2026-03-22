@@ -1,12 +1,11 @@
 'use client';
-
 import { useState, useCallback } from 'react';
 import Sidebar from '@/components/Sidebar';
 import ChatInput, { getKForMode, type Mode } from '@/components/ChatInput';
 
 interface Message {
   id: string;
-  role: 'user' | 'assistant' | 'error';
+  role: 'user' | 'assistant' | 'system' | 'error';
   content: string;
 }
 
@@ -40,7 +39,6 @@ export default function Home() {
   const handleSend = useCallback(
     async (query: string, k: number) => {
       const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: query };
-
       let chatId = currentChatId;
       const isNewChat = !currentChatId || currentChat?.messages.length === 0;
 
@@ -58,14 +56,9 @@ export default function Home() {
       }
 
       setLoading(true);
-
       try {
         const { answer } = await askBackend(query, k);
-        const assistantMsg: Message = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: answer,
-        };
+        const assistantMsg: Message = { id: crypto.randomUUID(), role: 'assistant', content: answer };
         setChats((prev) =>
           prev.map((c) =>
             c.id === chatId ? { ...c, messages: [...c.messages, assistantMsg] } : c
@@ -87,6 +80,30 @@ export default function Home() {
       }
     },
     [askBackend, currentChatId, currentChat]
+  );
+
+  const handleUpload = useCallback(
+    (fileName: string, chunksAdded: number) => {
+      const systemMsg: Message = {
+        id: crypto.randomUUID(),
+        role: 'system',
+        content: `📄 **${fileName}** has been uploaded and indexed (${chunksAdded} chunks). You can now ask questions from this book.`,
+      };
+
+      if (currentChatId) {
+        setChats((prev) =>
+          prev.map((c) =>
+            c.id === currentChatId ? { ...c, messages: [...c.messages, systemMsg] } : c
+          )
+        );
+      } else {
+        const chatId = crypto.randomUUID();
+        const title = `📄 ${fileName}`;
+        setChats((prev) => [{ id: chatId, title, messages: [systemMsg] }, ...prev.slice(0, 19)]);
+        setCurrentChatId(chatId);
+      }
+    },
+    [currentChatId]
   );
 
   const handleHistoryClick = useCallback((id: string) => {
@@ -111,7 +128,6 @@ export default function Home() {
         currentChatId={currentChatId}
         onSuggestedClick={(query) => handleSend(query, getKForMode(mode))}
       />
-
       <main
         className={`flex-1 flex flex-col min-w-0 bg-[var(--bg-main)] transition-[margin] duration-200 ${
           sidebarOpen ? 'ml-[280px]' : ''
@@ -140,7 +156,8 @@ export default function Home() {
           </button>
         </header>
 
-        <div className="flex-1 overflow-y-auto px-6 py-10 pb-32">
+        {/* pb-52 gives enough clearance for the fixed ChatInput (textarea + mode buttons + padding) */}
+        <div className="flex-1 overflow-y-auto px-6 py-10 pb-52">
           {showWelcome && (
             <div className="flex flex-col items-center justify-center min-h-[360px] text-center">
               <div className="w-20 h-20 rounded-full bg-gradient-to-br from-[var(--accent-teal)] via-[var(--accent-yellow)] to-[var(--accent-orange)] mb-6" />
@@ -160,18 +177,27 @@ export default function Home() {
                 key={msg.id}
                 className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
               >
-                <div
-                  className={`max-w-[85%] px-5 py-4 rounded-2xl text-[0.95rem] leading-relaxed whitespace-pre-wrap break-words
-                    ${
-                      msg.role === 'user'
-                        ? 'bg-[var(--bg-input)] border border-[var(--border)]'
-                        : msg.role === 'error'
+                {msg.role === 'system' ? (
+                  <div className="w-full flex justify-center">
+                    <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-2xl bg-[var(--accent-teal)]/8 border border-[var(--accent-teal)]/20 text-sm text-[var(--accent-teal)]">
+                      <PdfIcon className="w-4 h-4 shrink-0" />
+                      <span>{msg.content.replace(/\*\*/g, '')}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    className={`max-w-[85%] px-5 py-4 rounded-2xl text-[0.95rem] leading-relaxed whitespace-pre-wrap break-words
+                      ${
+                        msg.role === 'user'
+                          ? 'bg-[var(--bg-input)] border border-[var(--border)]'
+                          : msg.role === 'error'
                           ? 'bg-red-500/10 border border-red-500/50 text-red-400'
                           : 'bg-[var(--bg-card)] border border-[var(--border)]'
-                    }`}
-                >
-                  {msg.content}
-                </div>
+                      }`}
+                  >
+                    {msg.content}
+                  </div>
+                )}
               </div>
             ))}
 
@@ -226,6 +252,17 @@ function LightningIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
       <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+    </svg>
+  );
+}
+
+function PdfIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 2 14 8 20 8" />
+      <line x1="9" y1="13" x2="15" y2="13" />
+      <line x1="9" y1="17" x2="15" y2="17" />
     </svg>
   );
 }

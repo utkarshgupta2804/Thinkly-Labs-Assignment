@@ -6,14 +6,21 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import os
+from pypdf import PdfReader
 from config import GEMINI_API_KEY, MODEL_NAME, EMBEDDING_MODEL
 
 app = Flask(__name__)
 CORS(app)
 
+# 50MB max upload size
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
 # Configure Gemini client
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(MODEL_NAME)
+
+DATA_PATH = "data"
+os.makedirs(DATA_PATH, exist_ok=True)
 
 # Load FAISS index and data on startup
 print("📦 Loading index...")
@@ -31,6 +38,29 @@ with open("metadata.pkl", "rb") as f:
 print("📦 Loading embedding model...")
 embed_model = SentenceTransformer(EMBEDDING_MODEL)
 print("✅ Flask RAG backend ready!")
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def extract_text_from_pdf(pdf_path):
+    """Extract text from every page of a PDF file."""
+    reader = PdfReader(pdf_path)
+    pages = []
+    for page_num, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text:
+            pages.append({"text": text, "page": page_num})
+    return pages
+
+
+def chunk_text(text, chunk_size=500, overlap=200):
+    """Split text into overlapping chunks."""
+    chunks = []
+    for j in range(0, len(text), chunk_size - overlap):
+        chunk = text[j:j + chunk_size]
+        if chunk.strip():
+            chunks.append(chunk)
+    return chunks
 
 
 def retrieve(query, k=5):
@@ -54,7 +84,6 @@ Context:
 
 Question: {query}
 Answer:"""
-
     response = gemini_model.generate_content(prompt)
     return response.text.strip()
 
